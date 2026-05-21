@@ -256,36 +256,14 @@ function Start-RestoreJob {
     Write-Log "Grants snapshot : $GrantsFile"
 
     # ----- Step 1 command: Restore-DpSqlBackup -----
-    $step1Ps = @"
-Import-Module SqlServer;
-Restore-DpSqlBackup ``
-    -Name              ''$SourceDb'' ``
-    -BackupDestination TSM ``
-    -BackupMethod      legacy ``
-    -Replace ``
-    -SqlServer         ''$SqlServer'' ``
-    -SQLAUTHentication INTegrated ``
-    -Stripes           1 ``
-    -FromSqlServer     ''$FromSqlServer'' ``
-    -QueryNode         ''$QueryNode'' ``
-    -IntoDBName        ''$IntoDbName'' ``
-    -RestoreDate       ''$RestoreDate'' ``
-    -RestoreTime       ''$RestoreTime'' ``
-    -MountWait         Yes ``
-    -RelocateDir       ''$RelocateDir'' ``
-    -ConfigFile        ''$ConfigFile'' ``
-    -TsmOptFile        ''$TsmOptFile'' ``
-    -LogFile           ''$dpLogFile'';
-"@
+    $step1Ps = "Restore-DpSqlBackup -Name '$SourceDb' -BackupDestination TSM -BackupMethod legacy -Replace -SqlServer '$SqlServer' -SQLAUTHentication INTegrated -Stripes 1 -FromSqlServer '$FromSqlServer' -QueryNode '$QueryNode' -IntoDBName '$IntoDbName' -RestoreDate '$RestoreDate' -RestoreTime '$RestoreTime' -MountWait Yes -RelocateDir '$RelocateDir' -ConfigFile '$ConfigFile' -TsmOptFile '$TsmOptFile' -LogFile '$dpLogFile'"
 
     # ----- Step 2 command: replay grants -----
     # Skip gracefully if no snapshot was generated (first-time restore)
     if ($GrantsFile) {
         $step2Ps = @"
 if (Test-Path ''$GrantsFile'') {
-    Import-Module SqlServer;
-    Invoke-Sqlcmd -ServerInstance ''$SqlServer'' -Database ''$IntoDbName'' -InputFile ''$GrantsFile'' -ErrorAction Stop;
-    Write-Output ''Grants replayed from $GrantsFile'';
+    Invoke-Sqlcmd -ServerInstance '$SqlServer' -Database '$IntoDbName' -InputFile '$GrantsFile' -ErrorAction Stop;
 } else {
     Write-Output ''No grants snapshot file found; skipping.'';
 }
