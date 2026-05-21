@@ -136,10 +136,10 @@ $usersQuery = @"
 SET NOCOUNT ON;
 USE [$Database];
 SELECT
-    'IF NOT EXISTS (SELECT 1 FROM sys.database_principals WHERE name = ''' + dp.name + ''') ' +
-    'CREATE USER ' + QUOTENAME(dp.name) +
-    CASE WHEN sp.name IS NOT NULL THEN ' FOR LOGIN ' + QUOTENAME(sp.name) ELSE ' WITHOUT LOGIN' END +
-    ' WITH DEFAULT_SCHEMA = ' + QUOTENAME(ISNULL(dp.default_schema_name,'dbo')) + ';' AS stmt
+    'IF NOT EXISTS (SELECT 1 FROM sys.database_principals WHERE name = ''' + dp.name COLLATE DATABASE_DEFAULT + ''') ' +
+    'CREATE USER ' + QUOTENAME(dp.name) COLLATE DATABASE_DEFAULT +
+    CASE WHEN sp.name IS NOT NULL THEN ' FOR LOGIN ' + QUOTENAME(sp.name) COLLATE DATABASE_DEFAULT ELSE ' WITHOUT LOGIN' END +
+    ' WITH DEFAULT_SCHEMA = ' + QUOTENAME(ISNULL(dp.default_schema_name,'dbo')) COLLATE DATABASE_DEFAULT + ';' AS stmt
 FROM sys.database_principals dp
 LEFT JOIN sys.server_principals sp ON sp.sid = dp.sid
 WHERE dp.type IN ('S','U','G')
@@ -151,7 +151,7 @@ $rolesQuery = @"
 SET NOCOUNT ON;
 USE [$Database];
 SELECT
-    'ALTER ROLE ' + QUOTENAME(r.name) + ' ADD MEMBER ' + QUOTENAME(m.name) + ';' AS stmt
+    'ALTER ROLE ' + QUOTENAME(r.name) COLLATE DATABASE_DEFAULT + ' ADD MEMBER ' + QUOTENAME(m.name) COLLATE DATABASE_DEFAULT + ';' AS stmt
 FROM sys.database_role_members rm
 JOIN sys.database_principals r ON r.principal_id = rm.role_principal_id
 JOIN sys.database_principals m ON m.principal_id = rm.member_principal_id
@@ -165,14 +165,14 @@ USE [$Database];
 SELECT
     CASE dp.state WHEN 'G' THEN 'GRANT ' WHEN 'W' THEN 'GRANT '
                   WHEN 'D' THEN 'DENY '  WHEN 'R' THEN 'REVOKE ' END +
-    dp.permission_name +
+    dp.permission_name COLLATE DATABASE_DEFAULT +
     CASE
         WHEN dp.class = 0 THEN ''
-        WHEN dp.class = 1 THEN ' ON ' + QUOTENAME(SCHEMA_NAME(o.schema_id)) + '.' + QUOTENAME(o.name)
-        WHEN dp.class = 3 THEN ' ON SCHEMA::' + QUOTENAME(s.name)
+        WHEN dp.class = 1 THEN ' ON ' + QUOTENAME(SCHEMA_NAME(o.schema_id)) COLLATE DATABASE_DEFAULT + '.' + QUOTENAME(o.name) COLLATE DATABASE_DEFAULT
+        WHEN dp.class = 3 THEN ' ON SCHEMA::' + QUOTENAME(s.name) COLLATE DATABASE_DEFAULT
         ELSE ''
     END +
-    ' TO ' + QUOTENAME(USER_NAME(dp.grantee_principal_id)) +
+    ' TO ' + QUOTENAME(USER_NAME(dp.grantee_principal_id)) COLLATE DATABASE_DEFAULT +
     CASE WHEN dp.state = 'W' THEN ' WITH GRANT OPTION' ELSE '' END + ';' AS stmt
 FROM sys.database_permissions dp
 LEFT JOIN sys.objects o ON dp.class = 1 AND dp.major_id = o.object_id
