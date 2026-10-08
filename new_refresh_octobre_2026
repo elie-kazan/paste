@@ -1,1 +1,629 @@
+<#
+.SYNOPSIS
+    Self-service TSM/DP SQL restore.
 
+    DISPATCH mode (default - this is what you run):
+      1. Snapshots target grants
+      2. Stages this script (+ grants file) into $JobScriptDir, readable by SQL Agent
+      3. Creates a SQL Agent job whose steps call THIS SCRIPT via powershell.exe (CmdExec):
+           step 1 : Run-Restore.ps1 -Mode Restore   (Restore-DpSqlBackup)
+           step 2 : Run-Restore.ps1 -Mode Grants    (replay grants snapshot)
+      4. Starts the job and exits
+
+    WORKER modes (-Mode Restore / -Mode Grants) are run by the Agent job, not by you.
+    Each worker exits 0 on success, 1 on failure, so the job step status is accurate.
+
+.EXAMPLE
+    .\Run-Restore.ps1 -FromSqlServer "CS9PRDB03398\DX_SV_RS6ETAFIDR" `
+                      -SourceDatabase "TGK_DATA_017" `
+                      -SqlServer "CS9VADB03134\DP_SV_RS6ETAFIDR,12001" `
+                      -RestoreDate "02/27/2026" -RestoreTime "17:00:00" `
+                      -TsmOptFile "C:\Program Files\Tivoli\TSM\TDPSql\ISPPROXY-CS9VADB03134-CS9PRDB03398-SQL.opt"
+#>
+
+[CmdletBinding()]
+param(
+    [ValidateSet('Dispatch','Restore','Grants')]
+    [string]$Mode = 'Dispatch',
+
+    [string]$FromSqlServer,
+    [string]$SourceDatabase,
+    [string]$SqlServer,
+    [string]$RestoreDate,
+    [string]$RestoreTime,
+    [string]$TsmOptFile,
+
+    [string]$ConfigFile   = "C:\Program Files\Tivoli\TSM\TDPSql\tdpsql.cfg",
+    [string]$DpModulePath = "C:\Program Files\Tivoli\TSM\TDPSql\FmModuleSQL.dll",
+    [string]$QueryNode    = "DP",
+    [string]$GrantsDir    = "$env:USERPROFILE\Desktop\SQL-Restore",
+    [string]$LogDir       = "C:\Logs\TSM-Restore",
+    [string]$JobScriptDir = "C:\Scripts\TSM-Restore",   # must be readable by the SQL Agent account
+    [bool]  $IncludeHashedPasswords = $true,
+
+    # ---- Safety gate ----
+    [string]$ProdServerPattern = 'PRDB',   # regex matched against the target HOST name
+    [switch]$AllowProduction,              # required to even consider a production target
+    [switch]$Force,                        # skip the Y/N prompt on NON-production targets only
+
+    # ---- Worker-mode only (filled in by the job) ----
+    [string]$RelocateDir,
+    [string]$GrantsFile,
+    [string]$DpLogFile
+)
+
+try {
+    Import-Module SqlServer -ErrorAction Stop
+} catch {
+    Write-Host "[FATAL] SqlServer module not available for $($env:USERDOMAIN)\$($env:USERNAME): $($_.Exception.Message)"
+    exit 1
+}
+
+# =====================================================================
+# Helpers
+# =====================================================================
+function Write-Log {
+    param([string]$Message, [string]$Level = "INFO")
+    $line = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [$Level] $Message"
+    Write-Host $line
+    if ($script:LogFile) { Add-Content -Path $script:LogFile -Value $line }
+}
+
+# ---------------------------------------------------------------------
+# Get-DefaultDataPath
+#   Returns target instance's default data path with uppercase drive letter.
+# ---------------------------------------------------------------------
+function Get-DefaultDataPath {
+    param([string]$SqlInstance)
+
+    function Format-DrivePath([string]$p) {
+        if (-not $p) { return $p }
+        $p = $p -replace '\\$',''
+        if ($p -match '^[a-z]:') {
+            $p = $p.Substring(0,1).ToUpper() + $p.Substring(1)
+        }
+        return $p
+    }
+
+    try {
+        $row = Invoke-Sqlcmd -ServerInstance $SqlInstance -Query "
+            SELECT SERVERPROPERTY('InstanceDefaultDataPath') AS DataPath" -ErrorAction Stop
+        if ($row.DataPath) { return (Format-DrivePath $row.DataPath) }
+
+        $row = Invoke-Sqlcmd -ServerInstance $SqlInstance -Query "
+            SELECT TOP 1 physical_name FROM sys.master_files
+            WHERE database_id = 1 AND type = 0" -ErrorAction Stop
+        return (Format-DrivePath (Split-Path $row.physical_name -Parent))
+    } catch {
+        Write-Log "Could not detect default data path: $($_.Exception.Message)" "ERROR"
+        return $null
+    }
+}
+
+# ---------------------------------------------------------------------
+# Export-DbGrants
+#   Snapshots logins, users, role memberships, permissions into a .sql file.
+#   Returns the file path, or $null if the target DB doesn't exist yet.
+# ---------------------------------------------------------------------
+function Export-DbGrants {
+    param(
+        [string]$SqlInstance,
+        [string]$Database,
+        [string]$OutputDir,
+        [bool]$IncludeHashedPasswords
+    )
+
+    try {
+        $exists = Invoke-Sqlcmd -ServerInstance $SqlInstance -Query "
+            SELECT 1 AS x FROM sys.databases WHERE name = '$Database'" -ErrorAction Stop
+    } catch {
+        Write-Log "Cannot query target instance: $($_.Exception.Message)" "ERROR"
+        return $null
+    }
+
+    if (-not $exists) {
+        Write-Log "Target DB [$Database] does not exist yet - no grants to snapshot." "WARN"
+        return $null
+    }
+
+    if (-not (Test-Path $OutputDir)) {
+        New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
+    }
+
+    $safe    = ($SqlInstance -replace '[\\,:]','_') + "_${Database}"
+    $stamp   = Get-Date -Format "yyyyMMdd-HHmmss"
+    $outFile = Join-Path $OutputDir "grants_${safe}_${stamp}.sql"
+
+    Write-Log "Snapshotting grants from [$SqlInstance].[$Database] -> $outFile"
+
+    if ($IncludeHashedPasswords) {
+        $sqlLoginClause = @"
+            'CREATE LOGIN ' + QUOTENAME(sp.name) +
+            ' WITH PASSWORD = 0x' +
+            CONVERT(VARCHAR(MAX), sl.password_hash, 2) + ' HASHED, SID = 0x' +
+            CONVERT(VARCHAR(MAX), sp.sid, 2) + ', ' +
+            'CHECK_POLICY = ' + CASE WHEN sl.is_policy_checked = 1 THEN 'ON' ELSE 'OFF' END + ', ' +
+            'DEFAULT_DATABASE = ' + QUOTENAME(ISNULL(sp.default_database_name,'master')) + ';'
+"@
+    } else {
+        $sqlLoginClause = @"
+            'CREATE LOGIN ' + QUOTENAME(sp.name) +
+            ' WITH PASSWORD = ''CHANGE_ME_' + sp.name + ''' MUST_CHANGE, ' +
+            'CHECK_POLICY = ON, ' +
+            'DEFAULT_DATABASE = ' + QUOTENAME(ISNULL(sp.default_database_name,'master')) + ';'
+"@
+    }
+
+    $loginsQuery = @"
+SET NOCOUNT ON;
+SELECT
+    'IF NOT EXISTS (SELECT 1 FROM sys.server_principals WHERE name = ''' + sp.name + ''') ' +
+    CASE sp.type
+        WHEN 'S' THEN
+$sqlLoginClause
+        ELSE
+            'CREATE LOGIN ' + QUOTENAME(sp.name) + ' FROM WINDOWS ' +
+            'WITH DEFAULT_DATABASE = ' + QUOTENAME(ISNULL(sp.default_database_name,'master')) + ';'
+    END AS stmt
+FROM sys.server_principals sp
+INNER JOIN [$Database].sys.database_principals dp ON dp.sid = sp.sid
+LEFT JOIN sys.sql_logins sl ON sl.sid = sp.sid
+WHERE sp.type IN ('S','U','G')
+  AND sp.name NOT LIKE '##%'
+  AND sp.name NOT IN ('sa');
+"@
+
+    $usersQuery = @"
+SET NOCOUNT ON;
+USE [$Database];
+SELECT
+    'IF NOT EXISTS (SELECT 1 FROM sys.database_principals WHERE name = ''' + dp.name COLLATE DATABASE_DEFAULT + ''') ' +
+    'CREATE USER ' + QUOTENAME(dp.name) COLLATE DATABASE_DEFAULT +
+    CASE WHEN sp.name IS NOT NULL THEN ' FOR LOGIN ' + QUOTENAME(sp.name) COLLATE DATABASE_DEFAULT ELSE ' WITHOUT LOGIN' END +
+    ' WITH DEFAULT_SCHEMA = ' + QUOTENAME(ISNULL(dp.default_schema_name,'dbo')) COLLATE DATABASE_DEFAULT + ';' AS stmt
+FROM sys.database_principals dp
+LEFT JOIN sys.server_principals sp ON sp.sid = dp.sid
+WHERE dp.type IN ('S','U','G')
+  AND dp.name NOT IN ('dbo','guest','INFORMATION_SCHEMA','sys');
+"@
+
+    $rolesQuery = @"
+SET NOCOUNT ON;
+USE [$Database];
+SELECT
+    'ALTER ROLE ' + QUOTENAME(r.name) COLLATE DATABASE_DEFAULT + ' ADD MEMBER ' + QUOTENAME(m.name) COLLATE DATABASE_DEFAULT + ';' AS stmt
+FROM sys.database_role_members rm
+JOIN sys.database_principals r ON r.principal_id = rm.role_principal_id
+JOIN sys.database_principals m ON m.principal_id = rm.member_principal_id
+WHERE m.name NOT IN ('dbo');
+"@
+
+    $permsQuery = @"
+SET NOCOUNT ON;
+USE [$Database];
+SELECT
+    CASE dp.state WHEN 'G' THEN 'GRANT ' WHEN 'W' THEN 'GRANT '
+                  WHEN 'D' THEN 'DENY '  WHEN 'R' THEN 'REVOKE ' END +
+    dp.permission_name COLLATE DATABASE_DEFAULT +
+    CASE
+        WHEN dp.class = 0 THEN ''
+        WHEN dp.class = 1 THEN ' ON ' + QUOTENAME(SCHEMA_NAME(o.schema_id)) COLLATE DATABASE_DEFAULT + '.' + QUOTENAME(o.name) COLLATE DATABASE_DEFAULT
+        WHEN dp.class = 3 THEN ' ON SCHEMA::' + QUOTENAME(s.name) COLLATE DATABASE_DEFAULT
+        ELSE ''
+    END +
+    ' TO ' + QUOTENAME(USER_NAME(dp.grantee_principal_id)) COLLATE DATABASE_DEFAULT +
+    CASE WHEN dp.state = 'W' THEN ' WITH GRANT OPTION' ELSE '' END + ';' AS stmt
+FROM sys.database_permissions dp
+LEFT JOIN sys.objects o ON dp.class = 1 AND dp.major_id = o.object_id
+LEFT JOIN sys.schemas s ON dp.class = 3 AND dp.major_id = s.schema_id
+WHERE USER_NAME(dp.grantee_principal_id) NOT IN ('public','dbo','guest','INFORMATION_SCHEMA','sys');
+"@
+
+    $logins = (Invoke-Sqlcmd -ServerInstance $SqlInstance -Database master    -Query $loginsQuery -ErrorAction Stop).stmt
+    $users  = (Invoke-Sqlcmd -ServerInstance $SqlInstance -Database $Database -Query $usersQuery  -ErrorAction Stop).stmt
+    $roles  = (Invoke-Sqlcmd -ServerInstance $SqlInstance -Database $Database -Query $rolesQuery  -ErrorAction Stop).stmt
+    $perms  = (Invoke-Sqlcmd -ServerInstance $SqlInstance -Database $Database -Query $permsQuery  -ErrorAction Stop).stmt
+
+    $header = @"
+-- =====================================================================
+-- Grants snapshot for [$Database] on [$SqlInstance]
+-- Captured : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+-- By       : $env:USERNAME
+-- Hashed pw: $IncludeHashedPasswords
+-- =====================================================================
+SET NOCOUNT ON;
+GO
+
+"@
+
+    $body  = @()
+    $body += "-- ===== 1. Server logins (run in master) ====="
+    $body += "USE [master];"; $body += "GO"
+    if ($logins) { $body += $logins } else { $body += "-- (none)" }
+    $body += "GO"
+    $body += ""
+    $body += "-- ===== 2. Database users ====="
+    $body += "USE [$Database];"; $body += "GO"
+    if ($users) { $body += $users } else { $body += "-- (none)" }
+    $body += "GO"
+    $body += ""
+    $body += "-- ===== 3. Role memberships ====="
+    if ($roles) { $body += $roles } else { $body += "-- (none)" }
+    $body += "GO"
+    $body += ""
+    $body += "-- ===== 4. Permissions ====="
+    if ($perms) { $body += $perms } else { $body += "-- (none)" }
+    $body += "GO"
+
+    ($header + ($body -join "`r`n")) | Out-File -FilePath $outFile -Encoding UTF8
+
+    Write-Log ("Snapshot complete: logins={0}, users={1}, roles={2}, perms={3}" -f `
+        @($logins).Count, @($users).Count, @($roles).Count, @($perms).Count)
+    return $outFile
+}
+
+# ---------------------------------------------------------------------
+# Start-RestoreJob
+#   Creates an Agent job whose steps call THIS SCRIPT in worker mode
+#   through powershell.exe (CmdExec subsystem), then starts it.
+#   If no grants snapshot exists, the job is single-step.
+# ---------------------------------------------------------------------
+function Start-RestoreJob {
+    param(
+        [string]$ScriptPath,
+        [string]$FromSqlServer,
+        [string]$SourceDb,
+        [string]$SqlServer,
+        [string]$RestoreDate,
+        [string]$RestoreTime,
+        [string]$TsmOptFile,
+        [string]$ConfigFile,
+        [string]$DpModulePath,
+        [string]$QueryNode,
+        [string]$RelocateDir,
+        [string]$GrantsFile,
+        [string]$StepLogDir
+    )
+
+    foreach ($name in 'ScriptPath','FromSqlServer','SourceDb','SqlServer','RestoreDate','RestoreTime','TsmOptFile','ConfigFile','RelocateDir') {
+        if (-not (Get-Variable $name -ValueOnly)) {
+            throw "Required parameter '$name' is empty."
+        }
+    }
+
+    $jobName   = "RestoreJob_${SourceDb}_$(Get-Date -Format 'yyyyMMddHHmmss')_$env:USERNAME"
+    $dpLogFile = Join-Path $StepLogDir "${jobName}_dpsql.txt"
+
+    # Wrap a value in double quotes for the powershell.exe command line
+    function Format-Arg([string]$v) { '"' + $v + '"' }
+
+    $psExe  = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+    $common = "$psExe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $(Format-Arg $ScriptPath)" +
+              " -SqlServer $(Format-Arg $SqlServer) -SourceDatabase $(Format-Arg $SourceDb)"
+
+    # ----- Step 1: call this script in Restore mode -----
+    $step1Cmd = "$common -Mode Restore" +
+                " -FromSqlServer $(Format-Arg $FromSqlServer)" +
+                " -RestoreDate $(Format-Arg $RestoreDate) -RestoreTime $(Format-Arg $RestoreTime)" +
+                " -TsmOptFile $(Format-Arg $TsmOptFile) -ConfigFile $(Format-Arg $ConfigFile)" +
+                " -DpModulePath $(Format-Arg $DpModulePath) -QueryNode $(Format-Arg $QueryNode)" +
+                " -RelocateDir $(Format-Arg $RelocateDir) -DpLogFile $(Format-Arg $dpLogFile)"
+
+    # ----- Step 2: call this script in Grants mode (only if snapshot exists) -----
+    $hasGrants = -not [string]::IsNullOrWhiteSpace($GrantsFile)
+    if ($hasGrants) {
+        $step2Cmd = "$common -Mode Grants -GrantsFile $(Format-Arg $GrantsFile)"
+        $step1OnSuccess = 3   # go to next step
+    } else {
+        $step1OnSuccess = 1   # quit reporting success
+        Write-Log "No grants snapshot - job will be single-step (restore only)." "WARN"
+    }
+
+    Write-Log "Job name        : $jobName"
+    Write-Log "DP LogFile      : $dpLogFile"
+    Write-Log "Step 1 command  : $step1Cmd"
+    if ($hasGrants) { Write-Log "Step 2 command  : $step2Cmd" }
+
+    # Escape for T-SQL string literals
+    $step1Sql = $step1Cmd -replace "'", "''"
+    $step2Sql = if ($hasGrants) { $step2Cmd -replace "'", "''" } else { $null }
+
+    $createJobSql = @"
+USE msdb;
+DECLARE @jobId UNIQUEIDENTIFIER;
+
+EXEC dbo.sp_add_job
+    @job_name    = N'$jobName',
+    @enabled     = 1,
+    @description = N'TSM restore + grants replay (calls Run-Restore.ps1), by $env:USERNAME',
+    @job_id      = @jobId OUTPUT;
+
+EXEC dbo.sp_add_jobserver @job_id = @jobId, @server_name = N'(LOCAL)';
+
+EXEC dbo.sp_add_jobstep
+    @job_id               = @jobId,
+    @step_id              = 1,
+    @step_name            = N'1 - Run-Restore.ps1 -Mode Restore',
+    @subsystem            = N'CmdExec',
+    @command              = N'$step1Sql',
+    @cmdexec_success_code = 0,
+    @on_success_action    = $step1OnSuccess,
+    @on_fail_action       = 2,
+    @output_file_name     = N'$StepLogDir\${jobName}_step1.log';
+"@
+
+    if ($hasGrants) {
+        $createJobSql += @"
+
+EXEC dbo.sp_add_jobstep
+    @job_id               = @jobId,
+    @step_id              = 2,
+    @step_name            = N'2 - Run-Restore.ps1 -Mode Grants',
+    @subsystem            = N'CmdExec',
+    @command              = N'$step2Sql',
+    @cmdexec_success_code = 0,
+    @on_success_action    = 1,
+    @on_fail_action       = 2,
+    @output_file_name     = N'$StepLogDir\${jobName}_step2.log';
+"@
+    }
+
+    $createJobSql += @"
+
+EXEC dbo.sp_update_job @job_id = @jobId, @start_step_id = 1;
+EXEC dbo.sp_start_job  @job_name = N'$jobName';
+"@
+
+    Invoke-Sqlcmd -ServerInstance $SqlServer -Query $createJobSql -ErrorAction Stop
+    Write-Log "Job created and started. Returning control."
+    return $jobName
+}
+
+# ---------------------------------------------------------------------
+# Invoke-RestoreStep  (worker: -Mode Restore, run by the Agent job)
+# ---------------------------------------------------------------------
+function Invoke-RestoreStep {
+    foreach ($name in 'FromSqlServer','RestoreDate','RestoreTime','TsmOptFile','ConfigFile','RelocateDir') {
+        if (-not (Get-Variable $name -ValueOnly)) { throw "Missing -$name" }
+    }
+
+    if (-not (Get-Command Restore-DpSqlBackup -ErrorAction SilentlyContinue)) {
+        Write-Log "Importing DP/SQL module: $DpModulePath"
+        Import-Module $DpModulePath -ErrorAction Stop
+    }
+
+    $dpParams = @{
+        Name              = $SourceDatabase
+        BackupDestination = 'TSM'
+        BackupMethod      = 'legacy'
+        Replace           = $true
+        SqlServer         = $SqlServer
+        SQLAUTHentication = 'INTegrated'
+        Stripes           = 1
+        FromSqlServer     = $FromSqlServer
+        QueryNode         = $QueryNode
+        IntoDBName        = $IntoDbName
+        RestoreDate       = $RestoreDate
+        RestoreTime       = $RestoreTime
+        MountWait         = 'Yes'
+        RelocateDir       = $RelocateDir
+        ConfigFile        = $ConfigFile
+        TsmOptFile        = $TsmOptFile
+    }
+    if ($DpLogFile) { $dpParams.LogFile = $DpLogFile }
+
+    Write-Log "Calling Restore-DpSqlBackup with:"
+    $dpParams.GetEnumerator() | Sort-Object Key | ForEach-Object {
+        Write-Log ("  {0,-18}: {1}" -f $_.Key, $_.Value)
+    }
+
+    $result = Restore-DpSqlBackup @dpParams -ErrorAction Stop
+    if ($result) { $result | Out-String | Write-Host }
+
+    # Don't rely on the cmdlet alone: confirm the DB actually came back ONLINE
+    $state = Invoke-Sqlcmd -ServerInstance $SqlServer -ErrorAction Stop -Query "
+        SELECT state_desc FROM sys.databases WHERE name = N'$IntoDbName'"
+    if (-not $state -or $state.state_desc -ne 'ONLINE') {
+        throw "Restore returned but [$IntoDbName] state is '$($state.state_desc)' (expected ONLINE). Check $DpLogFile"
+    }
+    Write-Log "[$IntoDbName] is ONLINE."
+}
+
+# ---------------------------------------------------------------------
+# Invoke-GrantsStep  (worker: -Mode Grants, run by the Agent job)
+# ---------------------------------------------------------------------
+function Invoke-GrantsStep {
+    if (-not $GrantsFile) { throw "Missing -GrantsFile" }
+    if (-not (Test-Path -LiteralPath $GrantsFile)) {
+        throw "Grants file not found or not readable by $($env:USERDOMAIN)\$($env:USERNAME): $GrantsFile"
+    }
+    Write-Log "Replaying grants from $GrantsFile"
+    Invoke-Sqlcmd -ServerInstance $SqlServer -Database $IntoDbName -InputFile $GrantsFile -ErrorAction Stop -Verbose
+    Write-Log "Grants replayed."
+}
+
+# ---------------------------------------------------------------------
+# Confirm-RestoreTarget  (dispatch only)
+#   Safety gate before anything touches the target.
+#   - Production target (host matches $ProdServerPattern):
+#       refused unless -AllowProduction, and then you must type the DB name.
+#   - Any other target: Y/N confirmation (skip with -Force).
+# ---------------------------------------------------------------------
+function Confirm-RestoreTarget {
+    $targetHost = (($SqlServer -replace '^tcp:','') -split '[\\,]')[0]
+    $isProd     = $targetHost -match $ProdServerPattern
+    $envLabel   = if ($isProd) { 'PRODUCTION' } else { 'non-production' }
+    $envColor   = if ($isProd) { 'Red' } else { 'Green' }
+
+    Write-Host ""
+    Write-Host "==================== RESTORE SUMMARY ====================" -ForegroundColor Yellow
+    Write-Host ("  Source        : {0} / {1}" -f $FromSqlServer, $SourceDatabase)
+    Write-Host ("  Target        : {0} / {1}" -f $SqlServer, $IntoDbName)
+    Write-Host ("  Point in time : {0} {1}" -f $RestoreDate, $RestoreTime)
+    Write-Host ("  Environment   : {0}  (host '{1}')" -f $envLabel, $targetHost) -ForegroundColor $envColor
+    Write-Host  "  The target database will be OVERWRITTEN (REPLACE)."
+    Write-Host "=========================================================" -ForegroundColor Yellow
+    Write-Host ""
+
+    Write-Log "Target host '$targetHost' classified as $envLabel (pattern '$ProdServerPattern')."
+
+    if ($isProd) {
+        if (-not $AllowProduction) {
+            Write-Log "Refusing to restore over a PRODUCTION target. Re-run with -AllowProduction if this is really intended." "FATAL"
+            exit 1
+        }
+        Write-Log "PRODUCTION target allowed by -AllowProduction - asking for typed confirmation." "WARN"
+        $typed = Read-Host "You are about to OVERWRITE a PRODUCTION database. Type the database name '$IntoDbName' to continue"
+        if ($typed -ne $IntoDbName) {
+            Write-Log "Production confirmation failed (typed '$typed'). Aborted." "FATAL"
+            exit 1
+        }
+        Write-Log "PRODUCTION overwrite of [$IntoDbName] on $SqlServer confirmed by $env:USERNAME." "WARN"
+        return
+    }
+
+    if ($Force) {
+        Write-Log "Confirmation prompt skipped (-Force)."
+        return
+    }
+    $answer = Read-Host "Overwrite [$IntoDbName] on $SqlServer ? (Y/N)"
+    if ($answer -notmatch '^(y|yes)$') {
+        Write-Log "Aborted by user at confirmation prompt." "WARN"
+        exit 1
+    }
+    Write-Log "Restore confirmed by $env:USERNAME."
+}
+
+# =====================================================================
+# Worker modes (called by the Agent job)
+# =====================================================================
+$IntoDbName = $SourceDatabase  # overwrite mode
+
+if ($Mode -ne 'Dispatch') {
+    Write-Log "=== Worker mode: $Mode | running as $($env:USERDOMAIN)\$($env:USERNAME) on $env:COMPUTERNAME ==="
+    try {
+        if (-not $SqlServer)      { throw "Missing -SqlServer" }
+        if (-not $SourceDatabase) { throw "Missing -SourceDatabase" }
+
+        switch ($Mode) {
+            'Restore' { Invoke-RestoreStep }
+            'Grants'  { Invoke-GrantsStep }
+        }
+        Write-Log "=== $Mode step completed OK ==="
+        exit 0
+    } catch {
+        Write-Log $_.Exception.Message "FATAL"
+        if ($_.ScriptStackTrace) { Write-Log $_.ScriptStackTrace "FATAL" }
+        exit 1
+    }
+}
+
+# =====================================================================
+# Dispatch mode (run by you)
+# =====================================================================
+Write-Host "=== Self-Service SQL Restore from TSM ===" -ForegroundColor Cyan
+
+if (-not $FromSqlServer)  { $FromSqlServer  = Read-Host "Source SQL instance (FromSqlServer)" }
+if (-not $SourceDatabase) { $SourceDatabase = Read-Host "Source database name" }
+if (-not $SqlServer)      { $SqlServer      = Read-Host "Target SQL instance (with ,port if needed)" }
+if (-not $RestoreDate)    { $RestoreDate    = Read-Host "Restore date (MM/DD/YYYY)" }
+if (-not $RestoreTime)    { $RestoreTime    = Read-Host "Restore time (HH:MM:SS)" }
+if (-not $TsmOptFile)     { $TsmOptFile     = Read-Host "Full path to TSM .opt file" }
+
+$IntoDbName = $SourceDatabase  # overwrite mode
+
+foreach ($d in @($LogDir, $GrantsDir, $JobScriptDir)) {
+    if (-not (Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
+}
+
+$stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+$script:LogFile = Join-Path $LogDir "restore_${SourceDatabase}_${stamp}_$env:USERNAME.log"
+
+Write-Log "User         : $env:USERNAME"
+Write-Log "From         : $FromSqlServer / $SourceDatabase"
+Write-Log "Into         : $SqlServer / $IntoDbName (overwrite)"
+Write-Log "RestoreDate  : $RestoreDate $RestoreTime"
+Write-Log "TsmOptFile   : $TsmOptFile"
+Write-Log "ConfigFile   : $ConfigFile"
+Write-Log "DpModulePath : $DpModulePath"
+Write-Log "GrantsDir    : $GrantsDir"
+Write-Log "JobScriptDir : $JobScriptDir"
+Write-Log "LogDir       : $LogDir"
+Write-Log "LogFile      : $script:LogFile"
+
+# Safety gate: production check + "are you sure?" (exits if refused)
+Confirm-RestoreTarget
+
+foreach ($f in @($TsmOptFile, $ConfigFile)) {
+    if (-not (Test-Path $f)) {
+        Write-Log "Required file not found: $f" "FATAL"
+        exit 1
+    }
+}
+
+$RelocateDir = Get-DefaultDataPath -SqlInstance $SqlServer
+if (-not $RelocateDir) {
+    Write-Log "Could not detect target default data path - aborting." "FATAL"
+    exit 1
+}
+Write-Log "Target default data path: $RelocateDir"
+
+# 1. Stage this script where the SQL Agent account can read it
+$stagedScript = Join-Path $JobScriptDir 'Run-Restore.ps1'
+if ($PSCommandPath -ne $stagedScript) {
+    Copy-Item -LiteralPath $PSCommandPath -Destination $stagedScript -Force
+}
+Write-Log "Job will call   : $stagedScript"
+
+# 2. Snapshot target grants (may return $null on first-time restore)
+$grantsFile = Export-DbGrants -SqlInstance $SqlServer `
+                              -Database    $IntoDbName `
+                              -OutputDir   $GrantsDir `
+                              -IncludeHashedPasswords $IncludeHashedPasswords
+
+# Stage a copy of the grants file too (your Desktop isn't readable by the Agent account)
+$jobGrantsFile = $null
+if ($grantsFile) {
+    $jobGrantsFile = Join-Path $JobScriptDir (Split-Path $grantsFile -Leaf)
+    Copy-Item -LiteralPath $grantsFile -Destination $jobGrantsFile -Force
+    Write-Log "Grants staged   : $jobGrantsFile"
+}
+
+# 3. Kick connections off the existing DB
+try {
+    Invoke-Sqlcmd -ServerInstance $SqlServer -Query "
+        IF DB_ID('$IntoDbName') IS NOT NULL
+        BEGIN
+            ALTER DATABASE [$IntoDbName] SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
+            ALTER DATABASE [$IntoDbName] SET MULTI_USER;
+        END" -ErrorAction Stop
+    Write-Log "Cleared connections to [$IntoDbName]"
+} catch {
+    Write-Log "Pre-restore connection clear: $($_.Exception.Message)" "WARN"
+}
+
+# 4. Create + start the job; exit immediately after
+$jobName = Start-RestoreJob `
+    -ScriptPath    $stagedScript `
+    -FromSqlServer $FromSqlServer `
+    -SourceDb      $SourceDatabase `
+    -SqlServer     $SqlServer `
+    -RestoreDate   $RestoreDate `
+    -RestoreTime   $RestoreTime `
+    -TsmOptFile    $TsmOptFile `
+    -ConfigFile    $ConfigFile `
+    -DpModulePath  $DpModulePath `
+    -QueryNode     $QueryNode `
+    -RelocateDir   $RelocateDir `
+    -GrantsFile    $jobGrantsFile `
+    -StepLogDir    $LogDir
+
+Write-Log "=== Job dispatched: $jobName ==="
+Write-Host ""
+Write-Host "Job '$jobName' is running on $SqlServer." -ForegroundColor Green
+Write-Host "Use your usual progress query to track it." -ForegroundColor Green
+if ($grantsFile) {
+    Write-Host "Grants snapshot: $grantsFile" -ForegroundColor Green
+} else {
+    Write-Host "No grants snapshot (first-time restore) - job is single-step." -ForegroundColor Yellow
+}
