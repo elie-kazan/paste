@@ -51,6 +51,17 @@ function Write-Log {
     if ($script:LogFile) { Add-Content -Path $script:LogFile -Value $line }
 }
 
+# Shows a command before it runs (console + log).
+function Write-Cmd {
+    param([string]$Title, [string]$Text)
+    $shown = $Text.Trim()
+    $head  = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [CMD]  $Title"
+    $body  = ($shown -split "`r?`n" | ForEach-Object { "    $_" }) -join "`r`n"
+    Write-Host $head -ForegroundColor Cyan
+    Write-Host $body -ForegroundColor DarkCyan
+    if ($script:LogFile) { Add-Content -Path $script:LogFile -Value ($head + "`r`n" + $body) }
+}
+
 # ---------------------------------------------------------------------
 # Invoke-SqlQuery
 #   Module-free stand-in for Invoke-Sqlcmd (Windows auth).
@@ -296,7 +307,7 @@ function Invoke-RestoreStep {
         Import-Module $DpModulePath -ErrorAction Stop
     }
 
-    $dpParams = @{
+    $dpParams = [ordered]@{
         Name              = $SourceDatabase
         BackupDestination = 'TSM'
         BackupMethod      = 'legacy'
@@ -316,10 +327,13 @@ function Invoke-RestoreStep {
     }
     if ($DpLogFile) { $dpParams.LogFile = $DpLogFile }
 
-    Write-Log "Calling Restore-DpSqlBackup with:"
-    $dpParams.GetEnumerator() | Sort-Object Key | ForEach-Object {
-        Write-Log ("  {0,-18}: {1}" -f $_.Key, $_.Value)
+    # Copy-pasteable equivalent of the call below
+    $parts = foreach ($kv in $dpParams.GetEnumerator()) {
+        if ($kv.Value -is [bool]) { if ($kv.Value) { "-$($kv.Key)" } }
+        elseif ($kv.Value -is [int]) { "-$($kv.Key) $($kv.Value)" }
+        else { "-$($kv.Key) '$($kv.Value -replace "'", "''")'" }
     }
+    Write-Cmd "PowerShell" ("Restore-DpSqlBackup " + ($parts -join (" ``" + "`r`n    ")))
 
     # Run from the TDPSql folder (like an interactive session) and point the
     # TSM API error log (dsierror.log) to the log folder.
